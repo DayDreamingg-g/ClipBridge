@@ -14,12 +14,18 @@ internal static class Program
 
     // ====== App settings ======
     private const int MaxHistory = 20;
+    private const int MaxTextLength = 10_000; // protect against huge clipboard payloads
+    private static readonly TimeSpan PushCooldown = TimeSpan.FromMilliseconds(800);
+
+    // ====== Device ======
     private static readonly string DeviceId = Environment.MachineName;
 
     // ====== State ======
     private static readonly List<ClipboardItem> History = new();
     private static string? _lastText;
+    private static DateTime _lastPushTimeUtc = DateTime.MinValue;
 
+    // Firebase auth state
     private static string? _idToken;
     private static string? _uid;
 
@@ -36,8 +42,25 @@ internal static class Program
         Console.WriteLine("ClipBridge Windows Agent started.");
         Console.WriteLine($"Device ID: {DeviceId}");
 
-        // IMPORTANT: keep STA thread for Clipboard, call async login synchronously
-        FirebaseAnonymousLoginAsync().GetAwaiter().GetResult();
+        Console.CancelKeyPress += (_, e) =>
+        {
+            e.Cancel = true;
+            Console.WriteLine("\nShutting down ClipBridge...");
+            Environment.Exit(0);
+        };
+
+        // Keep STA thread for Clipboard; call async login sync
+        try
+        {
+            FirebaseAnonymousLoginAsync().GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[FATAL] Firebase login failed: {ex.Message}");
+            Console.WriteLine("Press any key to exit...");
+            Console.ReadKey();
+            return;
+        }
 
         Console.WriteLine("Listening clipboard (text only)...");
         Console.WriteLine("Copy anything (Ctrl+C) to sync to Firebase.\n");
@@ -50,29 +73,48 @@ internal static class Program
                 {
                     var text = Clipboard.GetText();
 
-                    if (!string.IsNullOrWhiteSpace(text) && text != _lastText)
+                    if (!string.IsNullOrWhiteSpace(text))
                     {
-                        _lastText = text;
+                        text = Sanitize(text);
 
-                        var item = AddToHistory(text);
+                        if (text != _lastText)
+                        {
+                            _lastText = text;
 
-                        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Clipboard updated. History: {History.Count}/{MaxHistory}");
-                        Console.WriteLine(text);
-                        Console.WriteLine("------");
+                            var item = AddToHistory(text);
 
-                        // Fire-and-forget push to cloud
-                        _ = PushToFirestoreAsync(item);
+                            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Clipboard updated. History: {History.Count}/{MaxHistory}");
+                            Console.WriteLine(text);
+                            Console.WriteLine("------");
+
+                            // Debounce to avoid spamming cloud
+                            if (DateTime.UtcNow - _lastPushTimeUtc > PushCooldown)
+                            {
+                                _lastPushTimeUtc = DateTime.UtcNow;
+                                _ = PushToFirestoreAsync(item);
+                            }
+                        }
                     }
                 }
             }
             catch (Exception ex)
             {
-                // Clipboard can be temporarily locked by another process OR STA issues
+                // Clipboard can be temporarily locked by another process
                 Console.WriteLine($"[WARN] Clipboard read failed: {ex.Message}");
             }
 
-            Thread.Sleep(400);
+            Thread.Sleep(350);
         }
+    }
+
+    private static string Sanitize(string text)
+    {
+        text = text.Trim();
+
+        if (text.Length > MaxTextLength)
+            text = text[..MaxTextLength];
+
+        return text;
     }
 
     private static ClipboardItem AddToHistory(string text)
@@ -84,7 +126,7 @@ internal static class Program
             CreatedAtUtc: DateTimeOffset.UtcNow
         );
 
-        // Prevent duplicates on top
+        // Prevent duplicates at the top
         if (History.Count > 0 && History[0].Text == item.Text)
             return History[0];
 
@@ -119,8 +161,7 @@ internal static class Program
             if (string.IsNullOrWhiteSpace(_idToken) || string.IsNullOrWhiteSpace(_uid))
                 return;
 
-            // POST new document to:
-            // users/{uid}/clipboard_items
+            // POST new document to: users/{uid}/clipboard_items
             var url =
                 $"https://firestore.googleapis.com/v1/projects/{FirebaseProjectId}/databases/(default)/documents/users/{_uid}/clipboard_items";
 
